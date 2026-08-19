@@ -1112,46 +1112,75 @@ function compactBRL(v){
   return fmtBRL(v);
 }
 
+// Charts for a collapsed accordion item are only created the moment it's opened (see the
+// dedicated note near the "init" section below on why canvases inside hidden containers can't
+// be trusted to size themselves at creation time). curvaCharted tracks which OKRs already got
+// their charts built during the CURRENT render pass, since renderCurva() rebuilds the whole
+// accordion (and therefore fresh <canvas> elements) every time the owner filter changes.
+let curvaCharted = new Set();
+function chartOkrCurve(entry){
+  const color = okrColor(entry.okrId);
+  entry.krs.filter(k => k.points.length).forEach(k => {
+    const canvasId = `chartCurva_${entry.okrId}_${k.kr.replace(/\s+/g,'')}`;
+    const isPct = k.unit === 'pct';
+    const labels = k.points.map(curvaLabel);
+    const values = k.points.map(p => isPct ? p.valor*100 : p.valor);
+    renderChart(canvasId, canvasId, {
+      type:'line',
+      data:{
+        labels,
+        datasets:[{ data: values, borderColor: color, backgroundColor: color, tension:.3, borderWidth:2.5, pointRadius:4, pointBackgroundColor:color, fill:false }]
+      },
+      options:{
+        maintainAspectRatio:false,
+        scales:{
+          x:{ grid:{display:false}, ticks:{font:{size:9.5}} },
+          y:{ grid:{color:'#EDEAE7'}, ticks:{font:{size:9.5}, callback:(v)=> isPct ? v+'%' : compactBRL(v)} },
+        },
+        plugins:{
+          legend:{display:false},
+          tooltip:{ callbacks:{ label:(ctx)=> isPct ? ctx.parsed.y.toLocaleString('pt-BR',{maximumFractionDigits:1})+'%' : fmtBRL(ctx.parsed.y) } }
+        }
+      }
+    });
+  });
+  curvaCharted.add(entry.okrId);
+}
+
 function renderCurva(){
-  // Respects the owner filter only (curve data lives at OKR/KR level, not per-initiative-status
-  // — same reasoning already applied to the financial charts). Every OKR in scope is shown: the
-  // ones with a "Curva" row filled in the sheet get their charts (like OKR 03 today); the rest
-  // get an explicit "ainda não configurada" notice instead of just disappearing, since more OKRs
-  // are expected to get this data filled in over time.
+  // Same accordion pattern as "Desempenho por OKR" (one row per OKR, click to expand) instead of
+  // showing every OKR's curves at once — respects the owner filter only (curve data lives at
+  // OKR/KR level, not per-initiative-status, same reasoning already applied to the financial
+  // charts). Every OKR in scope gets a row: the ones with a "Curva" row filled in the sheet show
+  // their charts once expanded; the rest show an explicit "ainda não configurada" notice instead
+  // of just disappearing, since more OKRs are expected to get this data filled in over time.
   const container = document.getElementById('curvaContent');
 
-  // This tab rebuilds its card grid (and therefore its <canvas> elements) on every render,
-  // since which KRs appear depends on the active filter. renderChart()'s cache keys charts by
-  // canvasId and calls .update() on a cache hit — fine for the other tabs, whose canvases are
-  // static and never leave the DOM, but wrong here: after a filter change the old canvas nodes
-  // are discarded and .update() would silently draw onto the orphaned, detached ones, leaving
-  // the new (same-id) canvases blank. Destroy every cached curva chart before rebuilding so each
-  // one is created fresh against the canvas that's actually in the DOM.
+  // Rebuilding the accordion discards the old <canvas> elements. renderChart()'s cache keys
+  // charts by canvasId and calls .update() on a cache hit — fine for tabs with static canvases,
+  // wrong here since .update() would silently draw onto the orphaned, detached ones. Destroy
+  // every cached curva chart before rebuilding, and reset which OKRs have been charted this pass.
   Object.keys(charts).forEach(k => {
     if(k.startsWith('chartCurva_')){ charts[k].destroy(); delete charts[k]; }
   });
+  curvaCharted = new Set();
 
   const curvaMap = new Map((DATA.curvas || []).map(o => [o.okrId, o]));
   const okrsF = filteredOkrs();
-  const withCurve = [], withoutCurve = [];
-  okrsF.forEach(okr => {
-    const entry = curvaMap.get(okr.id);
-    const hasData = entry && entry.krs.some(k => k.points.length);
-    if(hasData) withCurve.push(entry);
-    else withoutCurve.push(okr);
-  });
+  let withDataCount = 0;
 
   const statusNote = activeStatus ? ' · o filtro de status não se aplica aqui (curva é medida no nível do KR, não da iniciativa)' : '';
-  document.getElementById('curvaBannerSub').textContent = activeOwner
-    ? `Filtro: ${activeOwner}${statusNote}`
-    : `Disponível para ${withCurve.length} de ${okrsF.length} OKRs até o momento${statusNote}`;
 
-  const curveSections = withCurve.map(o => {
-    const color = okrColor(o.okrId);
-    const withPoints = o.krs.filter(k => k.points.length);
-    const noPoints = o.krs.filter(k => !k.points.length);
+  container.innerHTML = okrsF.length ? okrsF.map(okr => {
+    const color = okrColor(okr.id);
+    const entry = curvaMap.get(okr.id);
+    const withPoints = entry ? entry.krs.filter(k => k.points.length) : [];
+    const noPoints = entry ? entry.krs.filter(k => !k.points.length) : [];
+    const hasData = withPoints.length > 0;
+    if(hasData) withDataCount++;
+
     const cards = withPoints.map(k => {
-      const canvasId = `chartCurva_${o.okrId}_${k.kr.replace(/\s+/g,'')}`;
+      const canvasId = `chartCurva_${okr.id}_${k.kr.replace(/\s+/g,'')}`;
       return `<div class="bg-white rounded-xl border border-slate-200 p-4">
         <div class="flex items-center gap-2 mb-1">
           <span class="text-[10.5px] font-black uppercase tracking-wide curva-badge rounded-full" style="background:${color}22; color:${color}">${k.kr}</span>
@@ -1160,76 +1189,58 @@ function renderCurva(){
         <div class="relative curva-card"><canvas id="${canvasId}"></canvas></div>
       </div>`;
     }).join('');
-    const placeholder = noPoints.length
+    const missingPlaceholder = noPoints.length
       ? `<div class="bg-slate-50 rounded-xl curva-placeholder p-4 curva-flex-col items-center justify-center text-center">
           <i class="fa-solid fa-clock-rotate-left text-grafite-400 text-xl curva-mb2"></i>
           <p class="text-[11px] text-grafite-400">${noPoints.length===1 ? '1 KR' : noPoints.length+' KRs'} deste OKR ainda sem dados de curva reportados<br><span class="font-semibold">${noPoints.map(k=>k.kr).join(', ')}</span></p>
         </div>`
       : '';
-    return `<div class="mb-6">
-      <div class="flex items-center gap-2.5 mb-3">
-        <span class="curva-dot rounded-full flex-shrink-0" style="background:${color}"></span>
-        <h3 class="font-bold text-sm text-grafite-700">OKR ${String(o.okrId).padStart(2,'0')} · ${o.okrTitle}</h3>
-        <span class="text-[11px] text-grafite-400">${o.owner}</span>
+    const emptyBody = `<div class="bg-slate-50 rounded-xl curva-placeholder p-4 curva-flex-col items-center justify-center text-center">
+        <i class="fa-solid fa-clock-rotate-left text-grafite-400 text-xl curva-mb2"></i>
+        <p class="text-[11px] text-grafite-400">Ainda não configurada — aparecerá aqui quando a planilha tiver a curva deste OKR preenchida</p>
+      </div>`;
+
+    return `<div class="accordion border border-slate-200 rounded-xl overflow-hidden" data-curva-okr="${okr.id}">
+      <button class="accordion-toggle w-full flex items-center gap-3 p-4 hover:bg-slate-50 transition text-left">
+        <div class="w-9 h-9 rounded-lg flex items-center justify-center text-white text-xs font-black flex-shrink-0" style="background:${color}">${String(okr.id).padStart(2,'0')}</div>
+        <div class="flex-1 min-w-0">
+          <div class="font-bold text-sm text-grafite-700 truncate">${okr.title}</div>
+          <div class="text-[11px] text-grafite-400 mt-0.5">Dono: ${okr.owner}</div>
+        </div>
+        <div class="hidden sm:flex items-center gap-1.5 text-[10.5px] font-semibold flex-shrink-0">
+          ${hasData
+            ? `<span class="curva-badge rounded-full" style="background:${color}22; color:${color}">${withPoints.length} de ${okr.krs} KRs com curva</span>`
+            : `<span class="curva-badge rounded-full text-grafite-400" style="background:#F4F2F1">Ainda não configurada</span>`}
+        </div>
+        <i class="fa-solid fa-chevron-down chev text-grafite-400 flex-shrink-0"></i>
+      </button>
+      <div class="accordion-body">
+        <div class="px-4 pb-4">
+          <div class="curva-grid">${hasData ? cards + missingPlaceholder : emptyBody}</div>
+        </div>
       </div>
-      <div class="curva-grid">${cards}${placeholder}</div>
     </div>`;
-  }).join('');
-
-  const noCurveSection = withoutCurve.length
-    ? `<div class="bg-white rounded-xl border border-slate-200 p-4 mb-6">
-        <div class="flex items-center gap-2 mb-3">
-          <i class="fa-solid fa-clock-rotate-left text-grafite-400"></i>
-          <h3 class="font-bold text-sm text-grafite-700">${activeOwner ? 'Sem curva configurada' : 'OKRs sem curva configurada ainda'}</h3>
-        </div>
-        <div class="curva-grid">
-          ${withoutCurve.map(okr => {
-            const color = okrColor(okr.id);
-            return `<div class="bg-slate-50 rounded-xl curva-placeholder p-3.5 flex items-center gap-2.5">
-              <span class="curva-dot rounded-full flex-shrink-0" style="background:${color}"></span>
-              <div class="min-w-0">
-                <div class="text-[11px] font-bold text-grafite-600 truncate">OKR ${String(okr.id).padStart(2,'0')} · ${okr.owner}</div>
-                <div class="text-[10.5px] text-grafite-400 truncate">${okr.title}</div>
-                <div class="text-[10.5px] text-grafite-400 mt-0.5"><i class="fa-solid fa-circle-info mr-1"></i>Ainda não configurada — aparecerá aqui quando a planilha tiver a curva deste OKR preenchida</div>
-              </div>
-            </div>`;
-          }).join('')}
-        </div>
-      </div>`
-    : '';
-
-  container.innerHTML = curveSections + noCurveSection || `<div class="bg-white rounded-xl border border-slate-200 p-5 text-center text-grafite-400 text-sm">
+  }).join('') : `<div class="bg-white rounded-xl border border-slate-200 p-5 text-center text-grafite-400 text-sm">
       <i class="fa-solid fa-clock-rotate-left text-2xl curva-mb2 block"></i>
       Nenhum OKR no filtro atual.
     </div>`;
 
-  // Charts are created after the HTML above exists, so the canvases are in the DOM.
-  withCurve.forEach(o => {
-    const color = okrColor(o.okrId);
-    o.krs.filter(k => k.points.length).forEach(k => {
-      const canvasId = `chartCurva_${o.okrId}_${k.kr.replace(/\s+/g,'')}`;
-      const key = canvasId;
-      const isPct = k.unit === 'pct';
-      const labels = k.points.map(curvaLabel);
-      const values = k.points.map(p => isPct ? p.valor*100 : p.valor);
-      renderChart(key, canvasId, {
-        type:'line',
-        data:{
-          labels,
-          datasets:[{ data: values, borderColor: color, backgroundColor: color, tension:.3, borderWidth:2.5, pointRadius:4, pointBackgroundColor:color, fill:false }]
-        },
-        options:{
-          maintainAspectRatio:false,
-          scales:{
-            x:{ grid:{display:false}, ticks:{font:{size:9.5}} },
-            y:{ grid:{color:'#EDEAE7'}, ticks:{font:{size:9.5}, callback:(v)=> isPct ? v+'%' : compactBRL(v)} },
-          },
-          plugins:{
-            legend:{display:false},
-            tooltip:{ callbacks:{ label:(ctx)=> isPct ? ctx.parsed.y.toLocaleString('pt-BR',{maximumFractionDigits:1})+'%' : fmtBRL(ctx.parsed.y) } }
-          }
-        }
-      });
+  document.getElementById('curvaBannerSub').textContent = activeOwner
+    ? `Filtro: ${activeOwner}${statusNote}`
+    : `Disponível para ${withDataCount} de ${okrsF.length} OKRs até o momento${statusNote}`;
+
+  // Charts are only built the moment an accordion item is opened — same lazy-render discipline
+  // used for the tab-switch case below, since a canvas that's never been visible can't be
+  // trusted to report a real size to Chart.js.
+  document.querySelectorAll('#curvaContent .accordion-toggle').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const acc = btn.closest('.accordion');
+      acc.classList.toggle('open');
+      const okrId = Number(acc.dataset.curvaOkr);
+      const entry = curvaMap.get(okrId);
+      if(acc.classList.contains('open') && entry && !curvaCharted.has(okrId)){
+        chartOkrCurve(entry);
+      }
     });
   });
 }
